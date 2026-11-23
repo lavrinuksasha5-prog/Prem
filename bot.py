@@ -1,16 +1,30 @@
 import asyncio
 import json
 import os
-from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
-from storage import TEMP_DIR, get_account, import_zip_archive, init_storage, list_accounts, set_proxy_pool
+from browser_launcher import launch_web_telegram
+from storage import (
+    TEMP_DIR,
+    count_accounts,
+    get_account,
+    import_zip_archive,
+    init_storage,
+    list_accounts_page,
+    set_proxy_pool,
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_ТОКЕН_БОТА")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Укажите ваш Telegram user_id для защиты
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+PAGE_SIZE = 6
 
 dp = Dispatcher()
 
@@ -19,15 +33,82 @@ def is_allowed(user_id: int) -> bool:
     return ADMIN_ID == 0 or user_id == ADMIN_ID
 
 
+def _build_accounts_keyboard(offset: int, total: int) -> InlineKeyboardMarkup:
+    nav_buttons = []
+    if offset > 0:
+        prev_offset = max(0, offset - PAGE_SIZE)
+        nav_buttons.append(
+            InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page:{prev_offset}")
+        )
+    if offset + PAGE_SIZE < total:
+        next_offset = offset + PAGE_SIZE
+        nav_buttons.append(
+            InlineKeyboardButton(text="Вперед ➡️", callback_data=f"page:{next_offset}")
+        )
+
+    rows = []
+    if nav_buttons:
+        rows.append(nav_buttons)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _send_accounts_page(message: Message, offset: int = 0, edit: bool = False):
+    total = count_accounts()
+    if total == 0:
+        text = "Аккаунтов пока нет. Отправь <b>.zip</b> архив с парами <code>имя.session</code> и <code>имя.json</code>."
+        if edit:
+            await message.edit_text(text, parse_mode="HTML")
+        else:
+            await message.answer(text, parse_mode="HTML")
+        return
+
+    offset = max(0, min(offset, ((total - 1) // PAGE_SIZE) * PAGE_SIZE))
+    rows = list_accounts_page(offset=offset, limit=PAGE_SIZE)
+
+    page_num = offset // PAGE_SIZE + 1
+    total_pages = (total - 1) // PAGE_SIZE + 1
+
+    lines = [f"<b>Аккаунты (стр. {page_num}/{total_pages}, всего {total}):</b>\n"]
+    acc_buttons = []
+
+    for acc_id, name, proxy, fp_raw, two_fa in rows:
+        fp = json.loads(fp_raw)
+        has_2fa = "да" if two_fa else "нет"
+        lines.append(
+            f"• <b>#{acc_id} {name}</b> | 2FA: <code>{has_2fa}</code>\n"
+            f"  Proxy: <code>{proxy or 'нет'}</code>\n"
+            f"  FP: <code>{fp['platform']} | {fp['timezone']} | {fp['viewport']['width']}x{fp['viewport']['height']}</code>"
+        )
+        acc_buttons.append(
+            [InlineKeyboardButton(text=f"🌐 Open Web — {name}", callback_data=f"open_web:{acc_id}:{offset}")]
+        )
+
+    nav_row = []
+    if offset > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page:{max(0, offset - PAGE_SIZE)}"))
+    if offset + PAGE_SIZE < total:
+        nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"page:{offset + PAGE_SIZE}"))
+    if nav_row:
+        acc_buttons.append(nav_row)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=acc_buttons)
+    text = "\n".join(lines)
+
+    if edit:
+        await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     if not is_allowed(message.from_user.id):
         return
     await message.answer(
-        "Панель готова:\n"
-        "1. Кинь сюда <b>.zip</b> с парами <code>имя.session</code> + <code>имя.json</code> (от 1 шт).\n"
-        "2. Отправь <code>/proxies</code> и с новой строки список прокси (распределятся по всем аккам).\n"
-        "3. Нажми <code>/accs</code> — появится кнопка запуска в Web.",
+        "<b>Панель готова к работе:</b>\n"
+        "1. Кинь <b>.zip</b> архив с парами <code>имя.session</code> + <code>имя.json</code> (от 1 акка, поиск идет по всем вложенным папкам).\n"
+        "2. Залей прокси командой <code>/proxies</code> (можно хоть 1 прокси на 10+ акков — распределится автоматически).\n"
+        "3. Открой <code>/accs</code> и жми <b>Open Web</b>.",
         parse_mode="HTML",
     )
 
@@ -38,55 +119,63 @@ async def cmd_proxies(message: Message):
         return
     lines = message.text.splitlines()[1:]
     if not lines:
-        await message.answer("Формат:\n<code>/proxies\nhttp://user:pass@host:port\nhttp://user2:pass2@host2:port</code>", parse_mode="HTML")
+        await message.answer(
+            "Укажи прокси построчно:\n<code>/proxies\nhttp://user:pass@host:port</code>",
+            parse_mode="HTML",
+        )
         return
-    count = set_proxy_pool(lines)
-    await message.answer(f"Пул обновлен: <b>{count}</b> прокси распределены по аккаунтам.", parse_mode="HTML")
+    cnt = set_proxy_pool(lines)
+    await message.answer(f"Пул обновлен: <b>{cnt}</b> прокси распределены по аккаунтам.", parse_mode="HTML")
 
 
 @dp.message(Command("accs"))
 async def cmd_accs(message: Message):
     if not is_allowed(message.from_user.id):
         return
-    rows = list_accounts(limit=20)
-    if not rows:
-        await message.answer("Аккаунтов пока нет. Загрузи .zip архив с session + json.")
-        return
+    await _send_accounts_page(message, offset=0, edit=False)
 
-    for acc_id, name, proxy, fp_raw in rows:
-        fp = json.loads(fp_raw)
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text=f"🌐 Open Web ({name})", callback_data=f"open_web:{acc_id}")]
-            ]
-        )
-        await message.answer(
-            f"<b>#{acc_id} {name}</b>\n"
-            f"Proxy: <code>{proxy or 'не задан'}</code>\n"
-            f"FP: <code>{fp['platform']} | {fp['timezone']} | {fp['viewport']['width']}x{fp['viewport']['height']}</code>",
-            reply_markup=kb,
-            parse_mode="HTML",
-        )
+
+@dp.callback_query(F.data.startswith("page:"))
+async def cb_page(callback: CallbackQuery):
+    if not is_allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        offset = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная страница", show_alert=True)
+        return
+    await _send_accounts_page(callback.message, offset=offset, edit=True)
+    await callback.answer()
 
 
 @dp.message(F.document)
-async def handle_doc(message: Message, bot: Bot):
+async def handle_zip(message: Message, bot: Bot):
     if not is_allowed(message.from_user.id):
         return
     doc = message.document
     if not doc.file_name or not doc.file_name.lower().endswith(".zip"):
-        await message.answer("Нужен архив в формате <b>.zip</b> с парами .session и .json.", parse_mode="HTML")
+        await message.answer("Нужен архив в формате <b>.zip</b>.", parse_mode="HTML")
         return
 
     zip_path = TEMP_DIR / f"upload_{message.from_user.id}_{doc.file_name}"
     await bot.download(doc, destination=zip_path)
 
-    result = import_zip_archive(zip_path)
-    added_cnt = len(result["added"])
-    skipped_preview = "\n".join(result["skipped"][:10])
-    msg = f"Импорт завершен.\nДобавлено: <b>{added_cnt}</b>"
-    if result["skipped"]:
-        msg += f"\nПропущено ({len(result['skipped'])}):\n<code>{skipped_preview}</code>"
+    try:
+        res = import_zip_archive(zip_path)
+    except Exception as exc:
+        await message.answer(f"Ошибка обработки архива: <code>{exc}</code>", parse_mode="HTML")
+        return
+
+    msg = (
+        f"<b>Импорт завершен:</b>\n"
+        f"• Добавлено: <b>{len(res['added'])}</b>\n"
+        f"• Обновлено: <b>{len(res['updated'])}</b>\n"
+        f"• Пропущено: <b>{len(res['skipped'])}</b>"
+    )
+    if res["skipped"]:
+        preview = "\n".join(res["skipped"][:10])
+        msg += f"\n\nПричины пропуска:\n<code>{preview}</code>"
     await message.answer(msg, parse_mode="HTML")
 
 
@@ -96,25 +185,38 @@ async def cb_open_web(callback: CallbackQuery):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    acc_id = int(callback.data.split(":", 1)[1])
+    parts = callback.data.split(":")
+    try:
+        acc_id = int(parts[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный ID аккаунта", show_alert=True)
+        return
+
     acc = get_account(acc_id)
     if not acc:
         await callback.answer("Аккаунт не найден", show_alert=True)
         return
 
-    _, name, sess_path, json_path, proxy, fp_raw = acc
+    _, name, _, _, two_fa, proxy, fp_raw = acc
     fp = json.loads(fp_raw)
 
-    # Здесь ставится вызов вашего локального агента / очереди воркера запуска Playwright
-    await callback.answer(f"Задача на запуск {name} отправлена")
-    await callback.message.answer(
-        f"🚀 Запуск <b>{name}</b> в Web:\n"
-        f"• Session: <code>{sess_path}</code>\n"
-        f"• Proxy: <code>{proxy or 'без прокси'}</code>\n"
-        f"• TZ / Locale: <code>{fp['timezone']} / {fp['locale']}</code>\n"
-        f"• UA: <code>{fp['user_agent'][:55]}...</code>",
-        parse_mode="HTML",
-    )
+    await callback.answer(f"Запускаю {name}...")
+    try:
+        await launch_web_telegram(acc_name=name, raw_proxy=proxy, fp=fp)
+        two_fa_note = "\n• 2FA пароль: сохранен в БД (при запросе на входе подставьте его)" if two_fa else ""
+        await callback.message.answer(
+            f"✅ Открыт профиль <b>{name}</b> в Web:\n"
+            f"• Proxy: <code>{proxy or 'без прокси'}</code>\n"
+            f"• Locale / TZ: <code>{fp['locale']} / {fp['timezone']}</code>\n"
+            f"• Viewport: <code>{fp['viewport']['width']}x{fp['viewport']['height']}</code>"
+            f"{two_fa_note}",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        await callback.message.answer(
+            f"❌ Ошибка запуска <b>{name}</b>: <code>{exc}</code>",
+            parse_mode="HTML",
+        )
 
 
 async def main():
