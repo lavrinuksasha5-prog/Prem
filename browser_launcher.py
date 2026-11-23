@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
 
+from session_injector import build_local_storage_payload, extract_session_auth
+
 PROFILES_DIR = Path(os.getenv("DATA_DIR", "data")) / "browser_profiles"
 DISPLAY = os.getenv("DISPLAY", ":99")
 VNC_PORT = int(os.getenv("VNC_PORT", "5900"))
@@ -32,14 +34,12 @@ def _ensure_vnc_stack():
     if _vnc_started:
         return
 
-    # 1. Виртуальный экран Xvfb
     subprocess.Popen(
         ["Xvfb", DISPLAY, "-screen", "0", "1366x820x24", "-ac"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
-    # 2. VNC-сервер поверх дисплея
     subprocess.Popen(
         [
             "x11vnc",
@@ -55,7 +55,6 @@ def _ensure_vnc_stack():
         stderr=subprocess.DEVNULL,
     )
 
-    # 3. noVNC + websockify (слушает PORT на Railway, если задан, иначе NOVNC_WEB_PORT)
     listen_port = int(os.getenv("PORT", str(NOVNC_WEB_PORT)))
     novnc_web_root = "/usr/share/novnc"
     if Path(novnc_web_root).exists():
@@ -90,7 +89,7 @@ def _parse_proxy(raw_proxy: str | None) -> dict | None:
     return cfg
 
 
-def _build_stealth_init_script(fp: dict) -> str:
+def _build_stealth_init_script(fp: dict, ls_payload: dict[str, str] | None) -> str:
     vendor = json.dumps(fp.get("webgl_vendor", "Google Inc. (NVIDIA)"))
     renderer = json.dumps(
         fp.get(
@@ -102,11 +101,24 @@ def _build_stealth_init_script(fp: dict) -> str:
     dev_memory = int(fp.get("device_memory", 8))
     canvas_seed = int(fp.get("canvas_noise_seed", 123456))
     audio_seed = int(fp.get("audio_noise_seed", 654321))
+    ls_json = json.dumps(ls_payload or {})
 
     return f"""
     (() => {{
         const cSeed = {canvas_seed};
         const aSeed = {audio_seed};
+        const authItems = {ls_json};
+
+        // Инжект ключей сессии в localStorage до загрузки клиента WebK
+        if (authItems && Object.keys(authItems).length > 0) {{
+            try {{
+                if (!window.localStorage.getItem('user_auth')) {{
+                    for (const [k, v] of Object.entries(authItems)) {{
+                        window.localStorage.setItem(k, v);
+                    }}
+                }}
+            }} catch (e) {{}}
+        }}
 
         Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
         Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {hw_concurrency} }});
@@ -128,7 +140,6 @@ def _build_stealth_init_script(fp: dict) -> str:
             }};
         }}
 
-        // Микрошум в Canvas ImageData
         const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
         CanvasRenderingContext2D.prototype.getImageData = function(sx, sy, sw, sh) {{
             const imgData = origGetImageData.call(this, sx, sy, sw, sh);
@@ -140,7 +151,6 @@ def _build_stealth_init_script(fp: dict) -> str:
             return imgData;
         }};
 
-        // Микрошум в AudioContext
         if (window.AudioBuffer && AudioBuffer.prototype.getChannelData) {{
             const origGetChannelData = AudioBuffer.prototype.getChannelData;
             AudioBuffer.prototype.getChannelData = function(channel) {{
@@ -155,16 +165,35 @@ def _build_stealth_init_script(fp: dict) -> str:
     """
 
 
-async def launch_web_telegram(acc_name: str, raw_proxy: str | None, fp: dict) -> str | None:
-    """Поднимает Xvfb + noVNC и открывает web.telegram.org в изолированном профиле."""
+async def launch_web_telegram(
+    acc_name: str,
+    raw_proxy: str | None,
+    fp: dict,
+    session_path: str | None = None,
+    json_path: str | None = None,
+) -> tuple[str | None, bool]:
+    """Возвращает (novnc_url, injected_ok)."""
     _ensure_vnc_stack()
     await asyncio.sleep(0.5)
+
+    ls_payload: dict[str, str] | None = None
+    injected_ok = False
+    if session_path:
+        try:
+            auth_data = await extract_session_auth(
+                session_path=session_path,
+                json_path=json_path,
+                raw_proxy=raw_proxy,
+            )
+            ls_payload = build_local_storage_payload(auth_data)
+            injected_ok = True
+        except Exception:
+            injected_ok = False
 
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     user_data_dir = PROFILES_DIR / acc_name
     user_data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Закрываем прошлый контекст того же аккаунта, если был открыт
     prev = _active_contexts.pop(acc_name, None)
     if prev:
         old_ctx, old_pw = prev
@@ -183,7 +212,7 @@ async def launch_web_telegram(acc_name: str, raw_proxy: str | None, fp: dict) ->
     playwright = await async_playwright().start()
     context = await playwright.chromium.launch_persistent_context(
         user_data_dir=str(user_data_dir),
-        headless=False,  # Рендерим в виртуальный дисплей Xvfb, чтобы работал noVNC
+        headless=False,
         env=env,
         proxy=proxy_cfg,
         user_agent=fp.get("user_agent"),
@@ -198,9 +227,9 @@ async def launch_web_telegram(acc_name: str, raw_proxy: str | None, fp: dict) ->
         ],
     )
 
-    await context.add_init_script(_build_stealth_init_script(fp))
+    await context.add_init_script(_build_stealth_init_script(fp, ls_payload))
     page = context.pages[0] if context.pages else await context.new_page()
     await page.goto("https://web.telegram.org/k/", wait_until="domcontentloaded")
 
     _active_contexts[acc_name] = (context, playwright)
-    return get_novnc_url()
+    return get_novnc_url(), injected_ok
