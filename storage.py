@@ -1,18 +1,20 @@
+import hashlib
 import json
 import os
 import random
+import shutil
 import sqlite3
 import zipfile
 from pathlib import Path
 
-BASE_DIR = Path("data")
+BASE_DIR = Path(os.getenv("DATA_DIR", "data"))
 STORAGE_DIR = BASE_DIR / "accounts"
 TEMP_DIR = BASE_DIR / "temp"
 DB_PATH = BASE_DIR / "panel.db"
 
 FINGERPRINT_PRESETS = [
     {
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "platform": "Win32",
         "viewport": {"width": 1440, "height": 900},
         "hardware_concurrency": 8,
@@ -21,7 +23,7 @@ FINGERPRINT_PRESETS = [
         "webgl_renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
     },
     {
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "platform": "Win32",
         "viewport": {"width": 1920, "height": 1080},
         "hardware_concurrency": 12,
@@ -30,7 +32,7 @@ FINGERPRINT_PRESETS = [
         "webgl_renderer": "ANGLE (Intel, Intel(R) UHD Graphics 770 Direct3D11 vs_5_0 ps_5_0, D3D11)",
     },
     {
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "platform": "MacIntel",
         "viewport": {"width": 1512, "height": 982},
         "hardware_concurrency": 8,
@@ -60,6 +62,7 @@ def init_storage():
                 name TEXT UNIQUE NOT NULL,
                 session_path TEXT NOT NULL,
                 json_path TEXT NOT NULL,
+                two_fa TEXT,
                 proxy TEXT,
                 fingerprint_json TEXT NOT NULL
             )
@@ -69,7 +72,12 @@ def init_storage():
 
 
 def _detect_locale_and_tz(meta: dict) -> tuple[str, str]:
-    lang = str(meta.get("lang_pack") or meta.get("system_lang_code") or "en").lower()
+    lang = str(
+        meta.get("lang_pack")
+        or meta.get("system_lang_code")
+        or meta.get("lang_code")
+        or "en"
+    ).lower()
     if lang.startswith("pl"):
         return "pl-PL", "Europe/Warsaw"
     if lang.startswith("uk"):
@@ -81,8 +89,19 @@ def _detect_locale_and_tz(meta: dict) -> tuple[str, str]:
     return "en-US", "America/New_York"
 
 
-def build_fingerprint(meta: dict) -> str:
-    preset = random.choice(FINGERPRINT_PRESETS)
+def _extract_two_fa(meta: dict) -> str | None:
+    for key in ("twoFA", "two_fa", "password", "2fa", "cloud_password"):
+        val = meta.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def build_fingerprint(acc_name: str, meta: dict) -> str:
+    # Детерминированный выбор пресета по имени аккаунта + метаданным
+    seed = int(hashlib.sha256(acc_name.encode("utf-8")).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+    preset = rng.choice(FINGERPRINT_PRESETS)
     locale, timezone = _detect_locale_and_tz(meta)
     fp = {
         **preset,
@@ -92,125 +111,165 @@ def build_fingerprint(meta: dict) -> str:
     return json.dumps(fp, ensure_ascii=False)
 
 
+def _reassign_proxies_locked(conn: sqlite3.Connection):
+    proxies = [r[0] for r in conn.execute("SELECT raw_proxy FROM proxies ORDER BY id ASC").fetchall()]
+    acc_rows = conn.execute("SELECT id FROM accounts ORDER BY id ASC").fetchall()
+    if not acc_rows:
+        return
+    if not proxies:
+        conn.execute("UPDATE accounts SET proxy = NULL")
+        return
+    for idx, (acc_id,) in enumerate(acc_rows):
+        proxy_val = proxies[idx % len(proxies)]
+        conn.execute("UPDATE accounts SET proxy = ? WHERE id = ?", (proxy_val, acc_id))
+
+
 def set_proxy_pool(proxies: list[str]) -> int:
     clean = [p.strip() for p in proxies if p.strip()]
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM proxies")
         for p in clean:
             conn.execute("INSERT OR IGNORE INTO proxies (raw_proxy) VALUES (?)", (p,))
-        # Распределяем пул по кругу на все аккаунты
-        acc_rows = conn.execute("SELECT id FROM accounts ORDER BY id ASC").fetchall()
-        if clean:
-            for idx, (acc_id,) in enumerate(acc_rows):
-                proxy_val = clean[idx % len(clean)]
-                conn.execute("UPDATE accounts SET proxy = ? WHERE id = ?", (proxy_val, acc_id))
-        else:
-            conn.execute("UPDATE accounts SET proxy = NULL")
+        _reassign_proxies_locked(conn)
         conn.commit()
     return len(clean)
 
 
-def _get_next_proxy_round_robin(conn: sqlite3.Connection, current_count: int) -> str | None:
-    proxies = [r[0] for r in conn.execute("SELECT raw_proxy FROM proxies ORDER BY id ASC").fetchall()]
-    if not proxies:
-        return None
-    return proxies[current_count % len(proxies)]
+def _safe_extract_zip(zip_path: Path, dest_dir: Path):
+    dest_resolved = dest_dir.resolve()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+            target = (dest_resolved / member.filename).resolve()
+            # Защита от Zip Slip (выход за пределы dest_dir через ../)
+            if target != dest_resolved and dest_resolved not in target.parents:
+                raise ValueError(f"Небезопасный путь в архиве: {member.filename}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member, "r") as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+
+def _scan_all_files(root_dir: Path) -> tuple[dict[str, Path], dict[str, Path]]:
+    """Рекурсивно обходит вообще все папки и подпапки внутри распакованного архива."""
+    sessions: dict[str, Path] = {}
+    jsons: dict[str, Path] = {}
+
+    for current_root, _, files in os.walk(root_dir):
+        for fname in files:
+            full_path = Path(current_root) / fname
+            low = fname.lower()
+            if low.endswith(".session"):
+                stem = fname[:-8]
+                if stem:
+                    sessions[stem] = full_path
+            elif low.endswith(".json"):
+                stem = fname[:-5]
+                if stem:
+                    jsons[stem] = full_path
+
+    return sessions, jsons
 
 
 def import_zip_archive(zip_path: Path) -> dict:
-    extract_dir = TEMP_DIR / f"unpack_{os.getpid()}_{random.randint(1000, 9999)}"
+    extract_dir = TEMP_DIR / f"unpack_{os.getpid()}_{random.randint(10000, 99999)}"
     extract_dir.mkdir(parents=True, exist_ok=True)
 
-    added = []
-    skipped = []
+    added: list[str] = []
+    updated: list[str] = []
+    skipped: list[str] = []
 
     try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_dir)
-
-        sessions = {}
-        jsons = {}
-
-        for root, _, files in os.walk(extract_dir):
-            for fname in files:
-                full = Path(root) / fname
-                if fname.endswith(".session"):
-                    sessions[fname[:-8]] = full
-                elif fname.endswith(".json"):
-                    jsons[fname[:-5]] = full
+        _safe_extract_zip(zip_path, extract_dir)
+        sessions, jsons = _scan_all_files(extract_dir)
 
         with sqlite3.connect(DB_PATH) as conn:
-            existing_count = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
-
-            for name, sess_file in sessions.items():
+            for name, sess_file in sorted(sessions.items()):
                 json_file = jsons.get(name)
                 if not json_file:
-                    skipped.append(f"{name}: нет пары .json")
+                    skipped.append(f"{name}: не найден парный .json")
                     continue
 
                 try:
                     meta = json.loads(json_file.read_text(encoding="utf-8"))
+                    if not isinstance(meta, dict):
+                        raise ValueError("JSON должен быть объектом")
                 except Exception as exc:
-                    skipped.append(f"{name}: битый json ({exc})")
+                    skipped.append(f"{name}: ошибка чтения .json ({exc})")
                     continue
 
+                two_fa = _extract_two_fa(meta)
                 acc_dir = STORAGE_DIR / name
                 acc_dir.mkdir(parents=True, exist_ok=True)
+
                 target_sess = acc_dir / f"{name}.session"
                 target_json = acc_dir / f"{name}.json"
 
-                target_sess.write_bytes(sess_file.read_bytes())
-                target_json.write_bytes(json_file.read_bytes())
+                shutil.copyfile(sess_file, target_sess)
+                shutil.copyfile(json_file, target_json)
 
-                fp_json = build_fingerprint(meta)
-                proxy_assigned = _get_next_proxy_round_robin(conn, existing_count + len(added))
+                fp_json = build_fingerprint(name, meta)
 
-                try:
+                existing = conn.execute(
+                    "SELECT id, fingerprint_json FROM accounts WHERE name = ?", (name,)
+                ).fetchone()
+
+                if existing is None:
                     conn.execute(
                         """
-                        INSERT INTO accounts (name, session_path, json_path, proxy, fingerprint_json)
-                        VALUES (?, ?, ?, ?, ?)
+                        INSERT INTO accounts (name, session_path, json_path, two_fa, proxy, fingerprint_json)
+                        VALUES (?, ?, ?, ?, NULL, ?)
                         """,
-                        (name, str(target_sess), str(target_json), proxy_assigned, fp_json),
+                        (name, str(target_sess), str(target_json), two_fa, fp_json),
                     )
                     added.append(name)
-                except sqlite3.IntegrityError:
-                    # Обновим файлы и прокси, но сохраним старый фингерпринт
+                else:
+                    # Сохраняем уже выданный фингерпринт, обновляем файлы и 2FA
                     conn.execute(
                         """
                         UPDATE accounts
-                        SET session_path = ?, json_path = ?, proxy = COALESCE(?, proxy)
+                        SET session_path = ?, json_path = ?, two_fa = COALESCE(?, two_fa)
                         WHERE name = ?
                         """,
-                        (str(target_sess), str(target_json), proxy_assigned, name),
+                        (str(target_sess), str(target_json), two_fa, name),
                     )
-                    skipped.append(f"{name}: уже был в БД (обновлены файлы)")
+                    updated.append(name)
 
+            # Перераспределяем пул прокси по всем аккаунтам по кругу
+            _reassign_proxies_locked(conn)
             conn.commit()
     finally:
-        # Чистим временную папку распаковки и архив
-        for root, dirs, files in os.walk(extract_dir, topdown=False):
-            for f in files:
-                Path(root, f).unlink(missing_ok=True)
-            for d in dirs:
-                Path(root, d).rmdir()
-        extract_dir.rmdir()
+        shutil.rmtree(extract_dir, ignore_errors=True)
         zip_path.unlink(missing_ok=True)
 
-    return {"added": added, "skipped": skipped}
+    return {"added": added, "updated": updated, "skipped": skipped}
 
 
-def list_accounts(limit: int = 20) -> list[tuple]:
+def count_accounts() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+
+
+def list_accounts_page(offset: int = 0, limit: int = 6) -> list[tuple]:
     with sqlite3.connect(DB_PATH) as conn:
         return conn.execute(
-            "SELECT id, name, proxy, fingerprint_json FROM accounts ORDER BY id ASC LIMIT ?",
-            (limit,),
+            """
+            SELECT id, name, proxy, fingerprint_json, two_fa
+            FROM accounts
+            ORDER BY id ASC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
         ).fetchall()
 
 
 def get_account(acc_id: int) -> tuple | None:
     with sqlite3.connect(DB_PATH) as conn:
         return conn.execute(
-            "SELECT id, name, session_path, json_path, proxy, fingerprint_json FROM accounts WHERE id = ?",
+            """
+            SELECT id, name, session_path, json_path, two_fa, proxy, fingerprint_json
+            FROM accounts
+            WHERE id = ?
+            """,
             (acc_id,),
         ).fetchone()
