@@ -184,15 +184,22 @@ async def cb_open_web(callback: CallbackQuery):
         await callback.answer("Аккаунт не найден", show_alert=True)
         return
 
-    _, name, _, _, two_fa, proxy, fp_raw = acc
+    _, name, sess_path, json_path, two_fa, proxy, fp_raw = acc
     fp = json.loads(fp_raw)
     safe_name = html.escape(str(name))
     safe_proxy = html.escape(str(proxy or "без прокси"))
 
     await callback.answer(f"Запускаю {name}...")
     try:
-        novnc_url = await launch_web_telegram(acc_name=name, raw_proxy=proxy, fp=fp)
-        two_fa_note = "\n• 2FA пароль: зашифрован в БД (доступен в аккаунте)" if two_fa else ""
+        novnc_url, injected_ok = await launch_web_telegram(
+            acc_name=name,
+            raw_proxy=proxy,
+            fp=fp,
+            session_path=sess_path,
+            json_path=json_path,
+        )
+        inj_status = "впрыснута в профиль" if injected_ok else "не найдена / требуется ручной вход"
+        two_fa_note = "\n• 2FA пароль: зашифрован в БД" if two_fa else ""
 
         markup = None
         if novnc_url:
@@ -202,6 +209,7 @@ async def cb_open_web(callback: CallbackQuery):
 
         await callback.message.answer(
             f"✅ Открыт профиль <b>{safe_name}</b>:\n"
+            f"• Сессия: <code>{inj_status}</code>\n"
             f"• Proxy: <code>{safe_proxy}</code>\n"
             f"• FP: <code>{html.escape(str(fp['platform']))} | {fp['viewport']['width']}x{fp['viewport']['height']}</code>\n"
             f"• TZ / Locale: <code>{html.escape(str(fp['timezone']))} / {html.escape(str(fp['locale']))}</code>"
