@@ -29,17 +29,30 @@ def get_novnc_url() -> str | None:
     return None
 
 
-def _ensure_vnc_stack():
-    global _vnc_started
-    if _vnc_started:
-        return
+def _find_novnc_root() -> str | None:
+    candidates = [
+        "/usr/share/novnc",
+        "/usr/local/lib/python3.10/dist-packages/novnc",
+        "/opt/noVNC",
+    ]
+    for path in candidates:
+        if Path(path).exists() and (Path(path) / "vnc.html").exists():
+            return path
+    return None
 
+
+def start_vnc_stack_on_boot() -> int:
+    global _vnc_started
+    listen_port = int(os.getenv("PORT") or NOVNC_WEB_PORT)
+    if _vnc_started:
+        return listen_port
+
+    # 1. Виртуальный экран Xvfb
     subprocess.Popen(
         ["Xvfb", DISPLAY, "-screen", "0", "1366x820x24", "-ac"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
     )
 
+    # 2. VNC сервер поверх Xvfb
     subprocess.Popen(
         [
             "x11vnc",
@@ -51,25 +64,32 @@ def _ensure_vnc_stack():
             "-rfbport",
             str(VNC_PORT),
         ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
     )
 
-    listen_port = int(os.getenv("PORT", str(NOVNC_WEB_PORT)))
-    novnc_web_root = "/usr/share/novnc"
-    if Path(novnc_web_root).exists():
+    # 3. noVNC через websockify на порту Railway (PORT)
+    novnc_root = _find_novnc_root()
+    if novnc_root:
         subprocess.Popen(
             [
                 "websockify",
-                f"--web={novnc_web_root}",
+                f"--web={novnc_root}",
                 str(listen_port),
                 f"127.0.0.1:{VNC_PORT}",
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        )
+        print(f"[VNC] websockify запущен на порту {listen_port} (web={novnc_root}, display={DISPLAY})")
+    else:
+        print(f"[VNC] ВНИМАНИЕ: директория noVNC не найдена, запускаю websockify без --web на порту {listen_port}")
+        subprocess.Popen(
+            [
+                "websockify",
+                str(listen_port),
+                f"127.0.0.1:{VNC_PORT}",
+            ],
         )
 
     _vnc_started = True
+    return listen_port
 
 
 def _parse_proxy(raw_proxy: str | None) -> dict | None:
@@ -109,7 +129,6 @@ def _build_stealth_init_script(fp: dict, ls_payload: dict[str, str] | None) -> s
         const aSeed = {audio_seed};
         const authItems = {ls_json};
 
-        // Инжект ключей сессии в localStorage до загрузки клиента WebK
         if (authItems && Object.keys(authItems).length > 0) {{
             try {{
                 if (!window.localStorage.getItem('user_auth')) {{
@@ -172,9 +191,7 @@ async def launch_web_telegram(
     session_path: str | None = None,
     json_path: str | None = None,
 ) -> tuple[str | None, bool]:
-    """Возвращает (novnc_url, injected_ok)."""
-    _ensure_vnc_stack()
-    await asyncio.sleep(0.5)
+    start_vnc_stack_on_boot()
 
     ls_payload: dict[str, str] | None = None
     injected_ok = False
@@ -187,7 +204,8 @@ async def launch_web_telegram(
             )
             ls_payload = build_local_storage_payload(auth_data)
             injected_ok = True
-        except Exception:
+        except Exception as exc:
+            print(f"[INJECT] Ошибка извлечения сессии для {acc_name}: {exc}")
             injected_ok = False
 
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
