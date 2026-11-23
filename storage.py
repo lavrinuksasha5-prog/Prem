@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -7,40 +8,108 @@ import sqlite3
 import zipfile
 from pathlib import Path
 
+from cryptography.fernet import Fernet, InvalidToken
+
 BASE_DIR = Path(os.getenv("DATA_DIR", "data"))
 STORAGE_DIR = BASE_DIR / "accounts"
 TEMP_DIR = BASE_DIR / "temp"
 DB_PATH = BASE_DIR / "panel.db"
 
-FINGERPRINT_PRESETS = [
-    {
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "platform": "Win32",
-        "viewport": {"width": 1440, "height": 900},
-        "hardware_concurrency": 8,
-        "device_memory": 8,
-        "webgl_vendor": "Google Inc. (NVIDIA)",
-        "webgl_renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-    },
-    {
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "platform": "Win32",
-        "viewport": {"width": 1920, "height": 1080},
-        "hardware_concurrency": 12,
-        "device_memory": 16,
-        "webgl_vendor": "Google Inc. (Intel)",
-        "webgl_renderer": "ANGLE (Intel, Intel(R) UHD Graphics 770 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-    },
-    {
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "platform": "MacIntel",
-        "viewport": {"width": 1512, "height": 982},
-        "hardware_concurrency": 8,
-        "device_memory": 8,
-        "webgl_vendor": "Apple Inc.",
-        "webgl_renderer": "Apple M2",
-    },
+USER_AGENTS_POOL = [
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Win32",
+    ),
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        "Win32",
+    ),
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Win32",
+    ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "MacIntel",
+    ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "MacIntel",
+    ),
+    (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Linux x86_64",
+    ),
 ]
+
+WEBGL_POOL = [
+    (
+        "Google Inc. (NVIDIA)",
+        "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    ),
+    (
+        "Google Inc. (NVIDIA)",
+        "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    ),
+    (
+        "Google Inc. (NVIDIA)",
+        "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    ),
+    (
+        "Google Inc. (Intel)",
+        "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    ),
+    (
+        "Google Inc. (AMD)",
+        "ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    ),
+    ("Apple Inc.", "Apple M1"),
+    ("Apple Inc.", "Apple M2"),
+    ("Apple Inc.", "Apple M3"),
+]
+
+VIEWPORTS_POOL = [
+    (1366, 768),
+    (1440, 900),
+    (1536, 864),
+    (1600, 900),
+    (1920, 1080),
+    (1280, 720),
+]
+
+CPU_CORES_POOL = [4, 6, 8, 12, 16]
+RAM_GB_POOL = [4, 8, 16, 32]
+
+
+def _get_fernet() -> Fernet:
+    raw_key = os.getenv("ENCRYPTION_KEY", "").strip()
+    if raw_key:
+        try:
+            return Fernet(raw_key.encode("utf-8"))
+        except Exception:
+            pass
+    # Фолбэк: детерминированный ключ из BOT_TOKEN (для продакшена задайте отдельный ENCRYPTION_KEY)
+    token_seed = (os.getenv("BOT_TOKEN") or "default-panel-secret").encode("utf-8")
+    digest = hashlib.sha256(token_seed).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def encrypt_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    f = _get_fernet()
+    return f.encrypt(value.encode("utf-8")).decode("utf-8")
+
+
+def decrypt_value(token_str: str | None) -> str | None:
+    if not token_str:
+        return None
+    f = _get_fernet()
+    try:
+        return f.decrypt(token_str.encode("utf-8")).decode("utf-8")
+    except InvalidToken:
+        # На случай старых незашифрованных записей
+        return token_str
 
 
 def init_storage():
@@ -62,7 +131,7 @@ def init_storage():
                 name TEXT UNIQUE NOT NULL,
                 session_path TEXT NOT NULL,
                 json_path TEXT NOT NULL,
-                two_fa TEXT,
+                two_fa_enc TEXT,
                 proxy TEXT,
                 fingerprint_json TEXT NOT NULL
             )
@@ -97,14 +166,26 @@ def _extract_two_fa(meta: dict) -> str | None:
     return None
 
 
-def build_fingerprint(acc_name: str, meta: dict) -> str:
-    # Детерминированный выбор пресета по имени аккаунта + метаданным
-    seed = int(hashlib.sha256(acc_name.encode("utf-8")).hexdigest()[:8], 16)
-    rng = random.Random(seed)
-    preset = rng.choice(FINGERPRINT_PRESETS)
+def build_randomized_fingerprint(meta: dict) -> str:
+    # Полностью случайная генерация при импорте, но сохраняется в БД навсегда на аккаунт
+    ua, platform = random.choice(USER_AGENTS_POOL)
+    gl_vendor, gl_renderer = random.choice(WEBGL_POOL)
+    base_w, base_h = random.choice(VIEWPORTS_POOL)
+
+    width = max(1024, base_w + random.choice([-40, -20, 0, 0, 20, 40]))
+    height = max(640, base_h + random.choice([-30, -16, 0, 0, 16, 30]))
+
     locale, timezone = _detect_locale_and_tz(meta)
     fp = {
-        **preset,
+        "user_agent": ua,
+        "platform": platform,
+        "viewport": {"width": width, "height": height},
+        "hardware_concurrency": random.choice(CPU_CORES_POOL),
+        "device_memory": random.choice(RAM_GB_POOL),
+        "webgl_vendor": gl_vendor,
+        "webgl_renderer": gl_renderer,
+        "canvas_noise_seed": random.randint(100000, 999999999),
+        "audio_noise_seed": random.randint(100000, 999999999),
         "locale": locale,
         "timezone": timezone,
     }
@@ -121,7 +202,7 @@ def _reassign_proxies_locked(conn: sqlite3.Connection):
         return
     for idx, (acc_id,) in enumerate(acc_rows):
         proxy_val = proxies[idx % len(proxies)]
-        conn.execute("UPDATE accounts SET proxy = ? WHERE id = ?", (proxy_val, acc_id))
+        conn.execute("UPDATE accounts SET proxy = ? WHERE id = ?", (encrypt_value(proxy_val), acc_id))
 
 
 def set_proxy_pool(proxies: list[str]) -> int:
@@ -142,7 +223,6 @@ def _safe_extract_zip(zip_path: Path, dest_dir: Path):
             if member.is_dir():
                 continue
             target = (dest_resolved / member.filename).resolve()
-            # Защита от Zip Slip (выход за пределы dest_dir через ../)
             if target != dest_resolved and dest_resolved not in target.parents:
                 raise ValueError(f"Небезопасный путь в архиве: {member.filename}")
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -151,7 +231,6 @@ def _safe_extract_zip(zip_path: Path, dest_dir: Path):
 
 
 def _scan_all_files(root_dir: Path) -> tuple[dict[str, Path], dict[str, Path]]:
-    """Рекурсивно обходит вообще все папки и подпапки внутри распакованного архива."""
     sessions: dict[str, Path] = {}
     jsons: dict[str, Path] = {}
 
@@ -198,7 +277,7 @@ def import_zip_archive(zip_path: Path) -> dict:
                     skipped.append(f"{name}: ошибка чтения .json ({exc})")
                     continue
 
-                two_fa = _extract_two_fa(meta)
+                two_fa_enc = encrypt_value(_extract_two_fa(meta))
                 acc_dir = STORAGE_DIR / name
                 acc_dir.mkdir(parents=True, exist_ok=True)
 
@@ -208,34 +287,31 @@ def import_zip_archive(zip_path: Path) -> dict:
                 shutil.copyfile(sess_file, target_sess)
                 shutil.copyfile(json_file, target_json)
 
-                fp_json = build_fingerprint(name, meta)
-
                 existing = conn.execute(
                     "SELECT id, fingerprint_json FROM accounts WHERE name = ?", (name,)
                 ).fetchone()
 
                 if existing is None:
+                    fp_json = build_randomized_fingerprint(meta)
                     conn.execute(
                         """
-                        INSERT INTO accounts (name, session_path, json_path, two_fa, proxy, fingerprint_json)
+                        INSERT INTO accounts (name, session_path, json_path, two_fa_enc, proxy, fingerprint_json)
                         VALUES (?, ?, ?, ?, NULL, ?)
                         """,
-                        (name, str(target_sess), str(target_json), two_fa, fp_json),
+                        (name, str(target_sess), str(target_json), two_fa_enc, fp_json),
                     )
                     added.append(name)
                 else:
-                    # Сохраняем уже выданный фингерпринт, обновляем файлы и 2FA
                     conn.execute(
                         """
                         UPDATE accounts
-                        SET session_path = ?, json_path = ?, two_fa = COALESCE(?, two_fa)
+                        SET session_path = ?, json_path = ?, two_fa_enc = COALESCE(?, two_fa_enc)
                         WHERE name = ?
                         """,
-                        (str(target_sess), str(target_json), two_fa, name),
+                        (str(target_sess), str(target_json), two_fa_enc, name),
                     )
                     updated.append(name)
 
-            # Перераспределяем пул прокси по всем аккаунтам по кругу
             _reassign_proxies_locked(conn)
             conn.commit()
     finally:
@@ -252,9 +328,9 @@ def count_accounts() -> int:
 
 def list_accounts_page(offset: int = 0, limit: int = 6) -> list[tuple]:
     with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute(
+        rows = conn.execute(
             """
-            SELECT id, name, proxy, fingerprint_json, two_fa
+            SELECT id, name, proxy, fingerprint_json, two_fa_enc
             FROM accounts
             ORDER BY id ASC
             LIMIT ? OFFSET ?
@@ -262,14 +338,39 @@ def list_accounts_page(offset: int = 0, limit: int = 6) -> list[tuple]:
             (limit, offset),
         ).fetchall()
 
+    result = []
+    for acc_id, name, proxy_enc, fp_raw, two_fa_enc in rows:
+        result.append(
+            (
+                acc_id,
+                name,
+                decrypt_value(proxy_enc),
+                fp_raw,
+                decrypt_value(two_fa_enc),
+            )
+        )
+    return result
+
 
 def get_account(acc_id: int) -> tuple | None:
     with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute(
+        row = conn.execute(
             """
-            SELECT id, name, session_path, json_path, two_fa, proxy, fingerprint_json
+            SELECT id, name, session_path, json_path, two_fa_enc, proxy, fingerprint_json
             FROM accounts
             WHERE id = ?
             """,
             (acc_id,),
         ).fetchone()
+    if not row:
+        return None
+    acc_id, name, sess_path, json_path, two_fa_enc, proxy_enc, fp_raw = row
+    return (
+        acc_id,
+        name,
+        sess_path,
+        json_path,
+        decrypt_value(two_fa_enc),
+        decrypt_value(proxy_enc),
+        fp_raw,
+    )
