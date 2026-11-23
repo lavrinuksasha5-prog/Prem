@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import os
 
@@ -74,10 +75,12 @@ async def _send_accounts_page(message: Message, offset: int = 0, edit: bool = Fa
     for acc_id, name, proxy, fp_raw, two_fa in rows:
         fp = json.loads(fp_raw)
         has_2fa = "да" if two_fa else "нет"
+        safe_name = html.escape(str(name))
+        safe_proxy = html.escape(str(proxy or "нет"))
         lines.append(
-            f"• <b>#{acc_id} {name}</b> | 2FA: <code>{has_2fa}</code>\n"
-            f"  Proxy: <code>{proxy or 'нет'}</code>\n"
-            f"  FP: <code>{fp['platform']} | {fp['timezone']} | {fp['viewport']['width']}x{fp['viewport']['height']}</code>"
+            f"• <b>#{acc_id} {safe_name}</b> | 2FA: <code>{has_2fa}</code>\n"
+            f"  Proxy: <code>{safe_proxy}</code>\n"
+            f"  FP: <code>{html.escape(str(fp['platform']))} | {html.escape(str(fp['timezone']))} | {fp['viewport']['width']}x{fp['viewport']['height']}</code>"
         )
         acc_buttons.append(
             [InlineKeyboardButton(text=f"🌐 Open Web — {name}", callback_data=f"open_web:{acc_id}:{offset}")]
@@ -164,7 +167,10 @@ async def handle_zip(message: Message, bot: Bot):
     try:
         res = import_zip_archive(zip_path)
     except Exception as exc:
-        await message.answer(f"Ошибка обработки архива: <code>{exc}</code>", parse_mode="HTML")
+        await message.answer(
+            f"Ошибка обработки архива: <code>{html.escape(str(exc))}</code>",
+            parse_mode="HTML",
+        )
         return
 
     msg = (
@@ -175,7 +181,7 @@ async def handle_zip(message: Message, bot: Bot):
     )
     if res["skipped"]:
         preview = "\n".join(res["skipped"][:10])
-        msg += f"\n\nПричины пропуска:\n<code>{preview}</code>"
+        msg += f"\n\nПричины пропуска:\n<code>{html.escape(preview)}</code>"
     await message.answer(msg, parse_mode="HTML")
 
 
@@ -199,22 +205,24 @@ async def cb_open_web(callback: CallbackQuery):
 
     _, name, _, _, two_fa, proxy, fp_raw = acc
     fp = json.loads(fp_raw)
+    safe_name = html.escape(str(name))
+    safe_proxy = html.escape(str(proxy or "без прокси"))
 
     await callback.answer(f"Запускаю {name}...")
     try:
         await launch_web_telegram(acc_name=name, raw_proxy=proxy, fp=fp)
         two_fa_note = "\n• 2FA пароль: сохранен в БД (при запросе на входе подставьте его)" if two_fa else ""
         await callback.message.answer(
-            f"✅ Открыт профиль <b>{name}</b> в Web:\n"
-            f"• Proxy: <code>{proxy or 'без прокси'}</code>\n"
-            f"• Locale / TZ: <code>{fp['locale']} / {fp['timezone']}</code>\n"
+            f"✅ Открыт профиль <b>{safe_name}</b> в Web:\n"
+            f"• Proxy: <code>{safe_proxy}</code>\n"
+            f"• Locale / TZ: <code>{html.escape(str(fp['locale']))} / {html.escape(str(fp['timezone']))}</code>\n"
             f"• Viewport: <code>{fp['viewport']['width']}x{fp['viewport']['height']}</code>"
             f"{two_fa_note}",
             parse_mode="HTML",
         )
     except Exception as exc:
         await callback.message.answer(
-            f"❌ Ошибка запуска <b>{name}</b>: <code>{exc}</code>",
+            f"❌ Ошибка запуска <b>{safe_name}</b>: <code>{html.escape(str(exc))}</code>",
             parse_mode="HTML",
         )
 
