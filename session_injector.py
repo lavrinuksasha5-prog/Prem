@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import sqlite3
@@ -6,7 +5,6 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from telethon import TelegramClient
-from telethon.sessions import StringSession
 
 
 def _parse_telethon_proxy(raw_proxy: str | None) -> tuple | None:
@@ -19,7 +17,10 @@ def _parse_telethon_proxy(raw_proxy: str | None) -> tuple | None:
     if not parsed.hostname or not parsed.port:
         return None
 
-    import python_socks
+    try:
+        import python_socks
+    except ImportError:
+        return None
 
     scheme = parsed.scheme.lower()
     if scheme.startswith("socks5"):
@@ -39,7 +40,7 @@ def _parse_telethon_proxy(raw_proxy: str | None) -> tuple | None:
     )
 
 
-def _read_api_credentials(json_path: str | None) -> tuple[int, str]:
+def _read_api_credentials(json_path: str | None) -> tuple[int, str] | None:
     api_id = int(os.getenv("TG_API_ID", "0") or "0")
     api_hash = os.getenv("TG_API_HASH", "").strip()
 
@@ -57,13 +58,11 @@ def _read_api_credentials(json_path: str | None) -> tuple[int, str]:
             pass
 
     if not api_id or not api_hash:
-        raise ValueError("Не заданы api_id / api_hash ни в .json аккаунта, ни в TG_API_ID / TG_API_HASH")
-
+        return None
     return api_id, api_hash
 
 
 def _extract_auth_from_sqlite_session(session_path: str) -> tuple[int, bytes, int | None] | None:
-    """Прямое чтение dc_id, auth_key и user_id из SQLite-файла .session Telethon."""
     p = Path(session_path)
     if not p.exists():
         return None
@@ -91,7 +90,6 @@ async def extract_session_auth(
     json_path: str | None = None,
     raw_proxy: str | None = None,
 ) -> dict:
-    """Возвращает {'dc_id': int, 'auth_key_hex': str, 'user_id': int | None}."""
     direct = _extract_auth_from_sqlite_session(session_path)
     if direct and len(direct[1]) == 256:
         dc_id, auth_key, user_id = direct
@@ -101,7 +99,11 @@ async def extract_session_auth(
             "user_id": user_id,
         }
 
-    api_id, api_hash = _read_api_credentials(json_path)
+    creds = _read_api_credentials(json_path)
+    if not creds:
+        raise ValueError("Не удалось прочитать auth_key из .session и нет api_id/api_hash")
+
+    api_id, api_hash = creds
     proxy = _parse_telethon_proxy(raw_proxy)
 
     client = TelegramClient(session_path, api_id, api_hash, proxy=proxy)
@@ -123,12 +125,10 @@ async def extract_session_auth(
 
 
 def build_local_storage_payload(auth_data: dict) -> dict[str, str]:
-    """Формирует ключи localStorage для web.telegram.org/k/."""
     dc_id = int(auth_data["dc_id"])
     auth_key_hex = str(auth_data["auth_key_hex"])
     user_id = auth_data.get("user_id")
 
-    # WebK использует ключи вида dc{dc_id}_auth_key, dc{dc_id}_server_salt, user_auth
     payload: dict[str, str] = {
         f"dc{dc_id}_auth_key": json.dumps(auth_key_hex),
         "dc": str(dc_id),
