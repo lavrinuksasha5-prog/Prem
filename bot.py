@@ -12,7 +12,7 @@ from aiogram.types import (
     Message,
 )
 
-from browser_launcher import launch_web_telegram
+from browser_launcher import launch_web_telegram, start_vnc_stack_on_boot
 from storage import (
     TEMP_DIR,
     count_accounts,
@@ -226,6 +226,8 @@ async def cb_open_web(callback: CallbackQuery):
 
 async def main():
     init_storage()
+    start_vnc_stack_on_boot()
+    await asyncio.sleep(1.5)
     bot = Bot(token=BOT_TOKEN)
     await dp.start_polling(bot)
 
