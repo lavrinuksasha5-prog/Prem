@@ -34,25 +34,6 @@ def is_allowed(user_id: int) -> bool:
     return ADMIN_ID == 0 or user_id == ADMIN_ID
 
 
-def _build_accounts_keyboard(offset: int, total: int) -> InlineKeyboardMarkup:
-    nav_buttons = []
-    if offset > 0:
-        prev_offset = max(0, offset - PAGE_SIZE)
-        nav_buttons.append(
-            InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page:{prev_offset}")
-        )
-    if offset + PAGE_SIZE < total:
-        next_offset = offset + PAGE_SIZE
-        nav_buttons.append(
-            InlineKeyboardButton(text="Вперед ➡️", callback_data=f"page:{next_offset}")
-        )
-
-    rows = []
-    if nav_buttons:
-        rows.append(nav_buttons)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 async def _send_accounts_page(message: Message, offset: int = 0, edit: bool = False):
     total = count_accounts()
     if total == 0:
@@ -108,9 +89,9 @@ async def cmd_start(message: Message):
     if not is_allowed(message.from_user.id):
         return
     await message.answer(
-        "<b>Панель готова к работе:</b>\n"
-        "1. Кинь <b>.zip</b> архив с парами <code>имя.session</code> + <code>имя.json</code> (от 1 акка, поиск идет по всем вложенным папкам).\n"
-        "2. Залей прокси командой <code>/proxies</code> (можно хоть 1 прокси на 10+ акков — распределится автоматически).\n"
+        "<b>Панель готова:</b>\n"
+        "1. Кинь <b>.zip</b> с парами <code>имя.session</code> + <code>имя.json</code> (поиск по всем папкам).\n"
+        "2. Залей прокси через <code>/proxies</code> (можно 1 прокси на 10+ акков).\n"
         "3. Открой <code>/accs</code> и жми <b>Open Web</b>.",
         parse_mode="HTML",
     )
@@ -123,7 +104,7 @@ async def cmd_proxies(message: Message):
     lines = message.text.splitlines()[1:]
     if not lines:
         await message.answer(
-            "Укажи прокси построчно:\n<code>/proxies\nhttp://user:pass@host:port</code>",
+            "Формат:\n<code>/proxies\nhttp://user:pass@host:port</code>",
             parse_mode="HTML",
         )
         return
@@ -210,14 +191,22 @@ async def cb_open_web(callback: CallbackQuery):
 
     await callback.answer(f"Запускаю {name}...")
     try:
-        await launch_web_telegram(acc_name=name, raw_proxy=proxy, fp=fp)
-        two_fa_note = "\n• 2FA пароль: сохранен в БД (при запросе на входе подставьте его)" if two_fa else ""
+        novnc_url = await launch_web_telegram(acc_name=name, raw_proxy=proxy, fp=fp)
+        two_fa_note = "\n• 2FA пароль: зашифрован в БД (доступен в аккаунте)" if two_fa else ""
+
+        markup = None
+        if novnc_url:
+            markup = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="📱 Открыть в браузере телефона", url=novnc_url)]]
+            )
+
         await callback.message.answer(
-            f"✅ Открыт профиль <b>{safe_name}</b> в Web:\n"
+            f"✅ Открыт профиль <b>{safe_name}</b>:\n"
             f"• Proxy: <code>{safe_proxy}</code>\n"
-            f"• Locale / TZ: <code>{html.escape(str(fp['locale']))} / {html.escape(str(fp['timezone']))}</code>\n"
-            f"• Viewport: <code>{fp['viewport']['width']}x{fp['viewport']['height']}</code>"
+            f"• FP: <code>{html.escape(str(fp['platform']))} | {fp['viewport']['width']}x{fp['viewport']['height']}</code>\n"
+            f"• TZ / Locale: <code>{html.escape(str(fp['timezone']))} / {html.escape(str(fp['locale']))}</code>"
             f"{two_fa_note}",
+            reply_markup=markup,
             parse_mode="HTML",
         )
     except Exception as exc:
